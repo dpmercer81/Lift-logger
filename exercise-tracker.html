@@ -82,8 +82,8 @@
 
   // ── Live data + sync status ───────────────────────────────────────────────
   const DEFAULT_EXERCISES = [
-    { id: 'default-pushups', name: 'Push-Ups', unit: 'reps',  icon: '💪', color: '#e8ff47' },
-    { id: 'default-running', name: 'Running',  unit: 'miles', icon: '🏃', color: '#47b4ff' },
+    { id: 'default-pushups', name: 'Push-Ups', unit: 'reps',  color: '#e8ff47' },
+    { id: 'default-running', name: 'Running',  unit: 'miles', color: '#47b4ff' },
   ];
 
   let syncMeta = { pending: false, fromCache: true, everSynced: false };
@@ -502,13 +502,20 @@ header{display:flex;align-items:center;justify-content:space-between;gap:12px;pa
 .card-line{height:3px;width:100%;background:var(--c)}
 .card-header{display:flex;align-items:center;justify-content:space-between;padding:14px 16px 11px;border-bottom:1px solid var(--border);gap:9px}
 .name-wrap{display:flex;align-items:center;gap:9px;flex:1;min-width:0}
-.ex-icon{width:32px;height:32px;background:var(--surface2);border:none;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:1rem;flex-shrink:0;cursor:pointer;transition:background .15s;user-select:none}
-.ex-icon:hover{background:var(--border)}
 .ex-name{font-family:'Bebas Neue',sans-serif;font-size:1.25rem;letter-spacing:.08em;color:var(--text);background:transparent;border:none;outline:none;width:100%;min-width:0}
 .ex-name::placeholder{color:var(--muted)}
 .card-btns{display:flex;gap:5px}
 .icon-btn{background:var(--surface2);border:1px solid var(--border);color:var(--muted);width:28px;height:28px;border-radius:7px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:color .15s,border-color .15s}
 .icon-btn:hover{color:var(--danger);border-color:var(--danger)}
+.collapse-btn:hover{color:var(--text);border-color:var(--muted)}
+.collapse-btn svg{transition:transform .2s}
+/* Collapsed card: only the colour line and the title row stay visible. */
+.card.collapsed>:not(.card-line):not(.card-header){display:none}
+.card.collapsed .card-header{border-bottom:none;padding-bottom:13px}
+.card.collapsed .collapse-btn svg{transform:rotate(180deg)}
+.card.collapsed{align-self:start}
+.card.collapsed .card-header{cursor:pointer}
+.card.collapsed .ex-name{pointer-events:none}
 .unit-row{display:flex;align-items:center;gap:9px;padding:9px 16px 0}
 .unit-row label{font-size:.75rem;color:var(--label);text-transform:uppercase;letter-spacing:.07em;font-weight:600}
 .unit-input::placeholder{color:var(--muted);opacity:1}
@@ -673,7 +680,6 @@ header{display:flex;align-items:center;justify-content:space-between;gap:12px;pa
 
 <script>
 const PALETTE=['#e8ff47','#47b4ff','#ff8c47','#b047ff','#47ffb4','#ff4787','#ff47d4','#47ffd4'];
-const ICONS  =['💪','🏃','🚴','🧘','⚽','🏊','🤸','🥊','🎽','🏋️','🧗','🤾'];
 
 function gid()       { return Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
 function today()     { const d=new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; }
@@ -746,7 +752,7 @@ window.showToast = function(msg,type='',ms=2800) {
 let pendingFocusId=null;
 
 function addCard() {
-  const c={id:gid(),name:'New Exercise',unit:'reps',icon:ICONS[Math.floor(Math.random()*ICONS.length)],color:nextColor(),entries:[],createdAt:Date.now()};
+  const c={id:gid(),name:'New Exercise',unit:'reps',color:nextColor(),entries:[],createdAt:Date.now()};
   pendingFocusId=c.id;
   window.LL.createExercise(c);
   showToast('Exercise added ✓','success');
@@ -797,10 +803,30 @@ function updateField(id,field,val) {
   window.LL.updateExercise(id,{[field]:val});
 }
 
-function cycleIcon(id) {
-  const c=card(id); if(!c) return;
-  const i=ICONS.indexOf(c.icon);
-  window.LL.updateExercise(id,{icon:ICONS[(i+1)%ICONS.length]});
+// Collapsed cards are a per-device view preference, so they live in
+// localStorage rather than Firestore (phone collapsed, desktop expanded).
+const COLLAPSE_KEY='liftlog.collapsed';
+const collapsed=(()=>{ try{ return new Set(JSON.parse(localStorage.getItem(COLLAPSE_KEY)||'[]')); }catch{ return new Set(); } })();
+function saveCollapsed() {
+  const ids=new Set((window._cards||[]).map(c=>c.id));
+  collapsed.forEach(id=>{ if(ids.size&&!ids.has(id)) collapsed.delete(id); });
+  try{ localStorage.setItem(COLLAPSE_KEY,JSON.stringify([...collapsed])); }catch{}
+}
+function applyCollapsed(el,isCollapsed) {
+  el.classList.toggle('collapsed',isCollapsed);
+  const b=el.querySelector('.collapse-btn');
+  b.setAttribute('aria-expanded',String(!isCollapsed));
+  el.querySelector('.ex-name').tabIndex=isCollapsed?-1:0;
+  b.title=isCollapsed?'Expand':'Collapse';
+  b.setAttribute('aria-label',isCollapsed?'Expand exercise':'Collapse exercise');
+}
+function toggleCollapse(id) {
+  const v=views.get(id); if(!v) return;
+  const now=!v.el.classList.contains('collapsed');
+  if(now) collapsed.add(id); else collapsed.delete(id);
+  if(now&&v.el.contains(document.activeElement)) document.activeElement.blur();
+  applyCollapsed(v.el,now);
+  saveCollapsed();
 }
 
 function toggleLog(id) {
@@ -848,8 +874,12 @@ window.renderAll = function() {
   let prev=null;
   cards.forEach(c=>{
     let v=views.get(c.id);
-    if(!v){ v={el:buildCard(c),sig:null,chart:null}; views.set(c.id,v); }
-    const sig=JSON.stringify([c.name,c.unit,c.icon,c.color,c.entries]);
+    if(!v){
+      v={el:buildCard(c),sig:null,chart:null}; views.set(c.id,v);
+      if(c.id===pendingFocusId) collapsed.delete(c.id);
+      applyCollapsed(v.el,collapsed.has(c.id));
+    }
+    const sig=JSON.stringify([c.name,c.unit,c.color,c.entries]);
     if(sig!==v.sig){ patchCard(v,c); v.sig=sig; }
     const want=prev?prev.nextSibling:grid.firstChild;
     if(v.el!==want) grid.insertBefore(v.el,want);
@@ -872,10 +902,12 @@ function buildCard(c) {
     <div class="card-line"></div>
     <div class="card-header">
       <div class="name-wrap">
-        <button type="button" class="ex-icon" data-action="icon" title="Change icon" aria-label="Change icon"></button>
         <input class="ex-name" placeholder="Exercise Name" aria-label="Exercise name" enterkeyhint="done">
       </div>
       <div class="card-btns">
+        <button class="icon-btn collapse-btn" data-action="collapse" aria-expanded="true" title="Collapse" aria-label="Collapse exercise">
+          <svg width="12" height="12" viewBox="0 0 11 11" fill="none"><path d="M1.5 7l4-4 4 4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
         <button class="icon-btn" data-action="delete" title="Delete exercise" aria-label="Delete exercise">
           <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><path d="M1 1l9 9M10 1l-9 9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
         </button>
@@ -928,7 +960,6 @@ function patchCard(v,c) {
   const totals=a.days.map(d=>d.total);
 
   el.style.setProperty('--c',c.color||'#e8ff47');
-  q('.ex-icon').textContent=c.icon||'💪';
   setInput(q('.ex-name'),c.name||'');
   setInput(q('.unit-input'),a.unit);
   // Stats use daily totals (same numbers as the chart).
@@ -1056,10 +1087,15 @@ document.getElementById('cleanup').addEventListener('click',async e=>{
   const idOf=el=>el.closest('.card')?.dataset.id;
 
   grid.addEventListener('click',e=>{
-    const t=e.target.closest('[data-action]'); if(!t) return;
+    const t=e.target.closest('[data-action]');
+    if(!t){
+      const h=e.target.closest('.card.collapsed .card-header');
+      if(h&&!e.target.closest('input,button')) toggleCollapse(idOf(h));
+      return;
+    }
     const id=idOf(t); if(!id) return;
     switch(t.dataset.action){
-      case 'icon':      cycleIcon(id); break;
+      case 'collapse':  toggleCollapse(id); break;
       case 'delete':    deleteCard(id); break;
       case 'log':       logEntry(id); break;
       case 'toggle':    toggleLog(id); break;
