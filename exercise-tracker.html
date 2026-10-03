@@ -2,18 +2,23 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>LiftLog — Exercise Tracker</title>
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <script type="module">
   import { initializeApp }                              from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-  import { getFirestore, collection, doc, setDoc,
-           deleteDoc, onSnapshot, query, orderBy }      from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+  import { initializeFirestore, getFirestore,
+           persistentLocalCache, persistentMultipleTabManager,
+           collection, doc, setDoc, updateDoc, deleteDoc, getDoc,
+           writeBatch, arrayUnion, arrayRemove,
+           onSnapshot, query, orderBy }                 from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
   import { getAuth, onAuthStateChanged, signOut,
            createUserWithEmailAndPassword,
            signInWithEmailAndPassword,
            GoogleAuthProvider, signInWithPopup,
+           signInWithRedirect, getRedirectResult,
+           fetchSignInMethodsForEmail, linkWithCredential,
            sendPasswordResetEmail }                     from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -30,12 +35,25 @@
 };
   // ─────────────────────────────────────────────────────────────────────────
 
-  const app      = initializeApp(firebaseConfig);
-  const db       = getFirestore(app);
+  const app = initializeApp(firebaseConfig);
+
+  // Offline persistence: writes are stored in IndexedDB and synced when the
+  // connection returns, even if the tab is closed in between. If IndexedDB is
+  // unavailable (e.g. some private modes) the SDK falls back to memory.
+  let db;
+  try {
+    db = initializeFirestore(app, {
+      localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
+    });
+  } catch (e) {
+    console.warn('[LiftLog] Offline persistence unavailable, using memory cache.', e);
+    db = getFirestore(app);
+  }
   const auth     = getAuth(app);
   const provider = new GoogleAuthProvider();
 
   let unsubCards = null;
+  let listenUid  = null;
 
   // ── Auth state ────────────────────────────────────────────────────────────
   onAuthStateChanged(auth, user => {
@@ -49,53 +67,160 @@
   function showAuth() {
     document.getElementById('auth-screen').style.display = 'flex';
     document.getElementById('app-screen').style.display  = 'none';
-    if (unsubCards) { unsubCards(); unsubCards = null; }
-    window._cards = [];
+    stopListening();
+    window.resetCards();
   }
 
   function showApp(user) {
     document.getElementById('auth-screen').style.display = 'none';
     document.getElementById('app-screen').style.display  = 'block';
     document.getElementById('user-email').textContent    = user.displayName || user.email;
-    document.getElementById('user-avatar').textContent   = (user.displayName || user.email)[0].toUpperCase();
-    startListening(user.uid);
+    document.getElementById('user-avatar').textContent   = (user.displayName || user.email || '?')[0].toUpperCase();
+    document.getElementById('user-pill').title           = user.email || '';
+    if (listenUid !== user.uid) startListening(user.uid);
+  }
+
+  // ── Live data + sync status ───────────────────────────────────────────────
+  const DEFAULT_EXERCISES = [
+    { id: 'default-pushups', name: 'Push-Ups', unit: 'reps',  icon: '💪', color: '#e8ff47' },
+    { id: 'default-running', name: 'Running',  unit: 'miles', icon: '🏃', color: '#47b4ff' },
+  ];
+
+  let syncMeta = { pending: false, fromCache: true, everSynced: false };
+
+  function stopListening() {
+    if (unsubCards) { unsubCards(); unsubCards = null; }
+    listenUid = null;
   }
 
   function startListening(uid) {
-    if (unsubCards) unsubCards();
+    stopListening();
+    listenUid = uid;
+    syncMeta  = { pending: false, fromCache: true, everSynced: false };
+    updateSyncIndicator();
+
+    let seedState = 'unknown';   // unknown → checking → done
+    let first     = true;
     const q = query(collection(db, 'users', uid, 'exercises'), orderBy('createdAt'));
-    unsubCards = onSnapshot(q, snap => {
+
+    unsubCards = onSnapshot(q, { includeMetadataChanges: true }, snap => {
+      if (listenUid !== uid) return;
+
+      syncMeta.pending   = snap.metadata.hasPendingWrites;
+      syncMeta.fromCache = snap.metadata.fromCache;
+      if (!snap.metadata.fromCache) syncMeta.everSynced = true;
+      updateSyncIndicator();
+
       const incoming = [];
       snap.forEach(d => incoming.push({ id: d.id, ...d.data() }));
-      if (incoming.length === 0) {
-        const defaults = [
-          { id: gid(), name: 'Push-Ups', unit: 'reps',  icon: '💪', entries: [], color: '#e8ff47', createdAt: Date.now() },
-          { id: gid(), name: 'Running',  unit: 'miles', icon: '🏃', entries: [], color: '#47b4ff', createdAt: Date.now()+1 },
-        ];
-        defaults.forEach(c => saveCard(uid, c));
-        return;
+
+      // Seed defaults once per account, and only after hearing from the
+      // server, so an empty offline cache can't trigger a re-seed.
+      if (seedState === 'unknown' && !snap.metadata.fromCache) {
+        seedState = 'checking';
+        ensureSeeded(uid, incoming.length === 0)
+          .catch(err => console.error('[LiftLog] Seed check failed:', err))
+          .finally(() => {
+            seedState = 'done';
+            if (listenUid === uid) window.setCards(window._cards || [], true);
+          });
       }
-      window._cards = incoming;
-      renderAll();
-    }, err => { console.error(err); showToast('Firebase error — check console', 'error'); });
+
+      // Metadata-only snapshots (e.g. a write being confirmed) don't change
+      // any data, so skip the re-render.
+      if (!first && snap.docChanges().length === 0) return;
+      first = false;
+
+      // Until we know whether this account should be seeded, an empty list
+      // means "still loading", not "no exercises".
+      const ready = incoming.length > 0 || seedState === 'done';
+      window.setCards(incoming, ready);
+    }, err => {
+      console.error('[LiftLog] Firestore listener error:', err);
+      showToast(`Couldn't load data (${err.code || 'error'})`, 'error', 6000);
+    });
   }
 
-  // ── Firestore helpers ─────────────────────────────────────────────────────
-  function saveCard(uid, card) {
-    const { id, ...data } = card;
-    return setDoc(doc(db, 'users', uid, 'exercises', id), data);
+  async function ensureSeeded(uid, isEmpty) {
+    const metaRef = doc(db, 'users', uid, 'meta', 'settings');
+    const meta = await getDoc(metaRef);
+    if (meta.exists() && meta.data().seeded) return;
+    const batch = writeBatch(db);
+    if (isEmpty) {
+      const now = Date.now();
+      DEFAULT_EXERCISES.forEach(({ id, ...data }, i) => {
+        batch.set(doc(db, 'users', uid, 'exercises', id), { ...data, entries: [], createdAt: now + i });
+      });
+    }
+    // Existing accounts with data get the flag too, so deleting everything
+    // later leaves the list empty.
+    batch.set(metaRef, { seeded: true }, { merge: true });
+    guard(batch.commit(), 'defaults');
   }
 
-  function removeCard(uid, id) {
-    return deleteDoc(doc(db, 'users', uid, 'exercises', id));
+  function updateSyncIndicator() {
+    const el = document.getElementById('sync');
+    if (!el) return;
+    const online = navigator.onLine;
+    let state, text, title;
+    if (!online || (syncMeta.fromCache && syncMeta.everSynced)) {
+      state = 'offline'; text = 'Offline';
+      title = syncMeta.pending ? 'Changes are saved on this device and will sync when you reconnect.' : 'Working offline.';
+    } else if (syncMeta.fromCache) {
+      state = 'saving';  text = 'Connecting…'; title = 'Connecting to the server…';
+    } else if (syncMeta.pending) {
+      state = 'saving';  text = 'Saving…';     title = 'Saving your changes…';
+    } else {
+      state = 'saved';   text = 'Saved';       title = 'All changes saved.';
+    }
+    el.dataset.state = state;
+    el.title = title;
+    el.setAttribute('aria-label', text);
+    el.querySelector('.sync-text').textContent = text;
+  }
+  window.addEventListener('online',  updateSyncIndicator);
+  window.addEventListener('offline', updateSyncIndicator);
+
+  // ── Firestore writes ──────────────────────────────────────────────────────
+  // Writes never block the UI: the local cache (and therefore the snapshot
+  // listener) updates immediately. With offline persistence the promise only
+  // settles once the server confirms, so we just report failures.
+  function guard(promise, what) {
+    return Promise.resolve(promise).catch(err => {
+      console.error(`[LiftLog] Failed to save ${what}:`, err);
+      showToast(`Couldn't save ${what} (${err && err.code || 'unknown error'})`, 'error', 6000);
+    });
   }
 
-  // expose to global scope with current user baked in
-  window._saveCard   = (card) => saveCard(auth.currentUser.uid, card);
-  window._removeCard = (id)   => removeCard(auth.currentUser.uid, id);
-  window._fbReady    = true;
+  function run(what, fn) {
+    try { return guard(fn(), what); }
+    catch (err) { return guard(Promise.reject(err), what); }
+  }
+
+  function exRef(id) {
+    const user = auth.currentUser;
+    if (!user) throw Object.assign(new Error('Not signed in'), { code: 'unauthenticated' });
+    return doc(db, 'users', user.uid, 'exercises', id);
+  }
+
+  window.LL = {
+    createExercise: card       => run('exercise', () => { const { id, ...data } = card; return setDoc(exRef(id), data); }),
+    updateExercise: (id, data) => run('change',   () => updateDoc(exRef(id), data)),
+    addEntry:      (id, entry) => run('entry',    () => updateDoc(exRef(id), { entries: arrayUnion(entry) })),
+    removeEntry:   (id, entry) => run('deletion', () => updateDoc(exRef(id), { entries: arrayRemove(entry) })),
+    deleteExercise: id         => run('deletion', () => deleteDoc(exRef(id))),
+  };
 
   // ── Auth actions ──────────────────────────────────────────────────────────
+  // Google credential waiting to be linked after the user signs in with their
+  // password (see auth/account-exists-with-different-credential below).
+  let pendingGoogleCred = null;
+
+  async function signInMethods(email) {
+    try { return await fetchSignInMethodsForEmail(auth, email); }
+    catch { return []; }   // empty when email-enumeration protection is on
+  }
+
   window.doSignUp = async () => {
     const email = document.getElementById('auth-email').value.trim();
     const pass  = document.getElementById('auth-pass').value;
@@ -103,7 +228,15 @@
     try {
       clearAuthError();
       await createUserWithEmailAndPassword(auth, email, pass);
-    } catch(e) { setAuthError(friendlyError(e.code)); }
+    } catch(e) {
+      if (e.code === 'auth/email-already-in-use') {
+        const methods = await signInMethods(email);
+        if (methods.includes('google.com') && !methods.includes('password'))
+          return setAuthError('This email is already registered with Google. Tap "Continue with Google" to sign in — no new account needed.');
+        return setAuthError('That email is already registered. Sign in instead — or tap "Continue with Google" if that\'s how you signed up.');
+      }
+      setAuthError(friendlyError(e.code));
+    }
   };
 
   window.doSignIn = async () => {
@@ -112,19 +245,56 @@
     if (!email || !pass) return setAuthError('Please enter email and password.');
     try {
       clearAuthError();
-      await signInWithEmailAndPassword(auth, email, pass);
-    } catch(e) { setAuthError(friendlyError(e.code)); }
+      const cred = await signInWithEmailAndPassword(auth, email, pass);
+      if (pendingGoogleCred) {
+        const gc = pendingGoogleCred; pendingGoogleCred = null;
+        linkWithCredential(cred.user, gc)
+          .then(() => showToast('Google sign-in linked to your account ✓', 'success'))
+          .catch(err => console.error('[LiftLog] Linking Google failed:', err));
+      }
+    } catch(e) {
+      if (['auth/invalid-credential','auth/wrong-password','auth/user-not-found','auth/invalid-login-credentials'].includes(e.code)) {
+        const methods = await signInMethods(email);
+        if (methods.includes('google.com') && !methods.includes('password'))
+          return setAuthError('This email is registered with Google. Tap "Continue with Google" to sign in.');
+        if (!methods.length)
+          return setAuthError('Incorrect email or password. If you signed up with Google, tap "Continue with Google" instead.');
+      }
+      setAuthError(friendlyError(e.code));
+    }
   };
+
+  function handleGoogleError(e) {
+    if (['auth/popup-closed-by-user','auth/cancelled-popup-request','auth/user-cancelled'].includes(e.code)) return;
+    if (e.code === 'auth/account-exists-with-different-credential') {
+      pendingGoogleCred = GoogleAuthProvider.credentialFromError(e);
+      const email = e.customData && e.customData.email;
+      if (email) document.getElementById('auth-email').value = email;
+      setAuthError(`${email || 'This email'} already has a LiftLog account with a password. Sign in with your password below and Google will be linked to the same account.`);
+      return;
+    }
+    console.error('[LiftLog] Google sign-in failed:', e);
+    setAuthError(friendlyError(e.code));
+  }
 
   window.doGoogle = async () => {
     try {
       clearAuthError();
       await signInWithPopup(auth, provider);
-    } catch(e) { if (e.code !== 'auth/popup-closed-by-user') setAuthError(friendlyError(e.code)); }
+    } catch(e) {
+      // Popups are often blocked in in-app browsers / app webviews.
+      if (e.code === 'auth/popup-blocked' || e.code === 'auth/operation-not-supported-in-this-environment') {
+        try { await signInWithRedirect(auth, provider); } catch(e2) { handleGoogleError(e2); }
+        return;
+      }
+      handleGoogleError(e);
+    }
   };
+  getRedirectResult(auth).catch(handleGoogleError);
 
   window.doSignOut = async () => {
-    Object.keys(chartInst).forEach(id => { chartInst[id].destroy(); delete chartInst[id]; });
+    stopListening();
+    window.resetCards();
     await signOut(auth);
   };
 
@@ -160,11 +330,10 @@
       'auth/network-request-failed':  'Network error. Check your connection.',
       'auth/invalid-api-key':         'Firebase API key is invalid — check your config.',
       'auth/configuration-not-found':  'Firebase auth is not configured correctly.',
+      'auth/unauthorized-domain':     'This site isn\'t authorized for sign-in. Add it in Firebase Console → Authentication → Settings.',
     };
-    return map[code] || 'Something went wrong. Please try again.';
+    return map[code] || `Something went wrong (${code || 'unknown'}). Please try again.`;
   }
-
-  function gid() { return Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
 
   window.togglePass = function() {
     const inp = document.getElementById('auth-pass');
@@ -182,9 +351,14 @@
 :root{
   --bg:#0b0d12;--surface:#12151e;--surface2:#181c28;--border:#252b3d;
   --accent:#e8ff47;--accent2:#47b4ff;--text:#dde1f0;--muted:#5c6380;
-  --danger:#ff5252;--success:#47ffb4;--radius:14px;
+  --danger:#ff5252;--success:#47ffb4;--warn:#ff8c47;--radius:14px;
 }
-body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min-height:100vh}
+/* Safety net against horizontal overflow. html's overflow goes to the
+   viewport (keeps sticky header working); body uses clip, which unlike
+   hidden doesn't turn body into a scroll container. */
+html{overflow-x:hidden;-webkit-text-size-adjust:100%;text-size-adjust:100%}
+body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min-height:100vh;overflow-x:clip}
+[hidden]{display:none!important}
 
 /* ── Auth Screen ─────────────────────────────────────────────────────────── */
 #auth-screen{
@@ -260,40 +434,46 @@ body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min
 #auth-error{display:none;font-size:.8rem;text-align:center;padding:8px 12px;background:rgba(255,82,82,.08);border-radius:7px;border:1px solid rgba(255,82,82,.2)}
 
 /* ── App Screen ──────────────────────────────────────────────────────────── */
-#app-screen{display:none;padding-bottom:60px}
+#app-screen{display:none;padding-bottom:calc(60px + env(safe-area-inset-bottom))}
 
-header{display:flex;align-items:center;justify-content:space-between;padding:18px 36px;border-bottom:1px solid var(--border);position:sticky;top:0;background:rgba(11,13,18,.94);backdrop-filter:blur(14px);z-index:100}
-.logo{font-family:'Bebas Neue',sans-serif;font-size:1.9rem;letter-spacing:.14em;color:var(--accent);line-height:1}
+header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:calc(18px + env(safe-area-inset-top)) max(36px,env(safe-area-inset-right)) 18px max(36px,env(safe-area-inset-left));border-bottom:1px solid var(--border);position:sticky;top:0;background:rgba(11,13,18,.94);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);z-index:100}
+.logo{font-family:'Bebas Neue',sans-serif;font-size:1.9rem;letter-spacing:.14em;color:var(--accent);line-height:1;flex-shrink:0}
 .logo span{color:var(--text)}
-.hright{display:flex;align-items:center;gap:10px}
+.hright{display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:10px;min-width:0}
 
-.user-pill{display:flex;align-items:center;gap:8px;background:var(--surface2);border:1px solid var(--border);border-radius:40px;padding:5px 12px 5px 6px}
+.sync{display:flex;align-items:center;gap:6px;font-size:.72rem;color:var(--muted);white-space:nowrap}
+.sync-dot{width:7px;height:7px;border-radius:50%;background:var(--success);flex-shrink:0}
+.sync[data-state="saving"] .sync-dot{background:var(--accent);animation:pulse 1.2s ease-in-out infinite}
+.sync[data-state="offline"] .sync-dot{background:var(--warn)}
+.sync[data-state="offline"]{color:var(--warn)}
+
+.user-pill{display:flex;align-items:center;gap:8px;background:var(--surface2);border:1px solid var(--border);border-radius:40px;padding:5px 12px 5px 6px;min-width:0}
 .user-avatar{width:26px;height:26px;border-radius:50%;background:var(--accent);color:#0b0d12;font-weight:700;font-size:.78rem;display:flex;align-items:center;justify-content:center;flex-shrink:0}
 .user-email{font-size:.78rem;color:var(--muted);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
-.signout-btn{background:var(--surface2);border:1px solid var(--border);color:var(--muted);padding:6px 13px;border-radius:7px;font-family:'DM Sans',sans-serif;font-size:.78rem;font-weight:500;cursor:pointer;transition:color .15s,border-color .15s}
+.signout-btn{background:var(--surface2);border:1px solid var(--border);color:var(--muted);padding:6px 13px;border-radius:7px;font-family:'DM Sans',sans-serif;font-size:.78rem;font-weight:500;cursor:pointer;white-space:nowrap;transition:color .15s,border-color .15s}
 .signout-btn:hover{color:var(--danger);border-color:var(--danger)}
 
-.add-btn{display:flex;align-items:center;gap:7px;background:var(--accent);color:#0b0d12;border:none;padding:9px 17px;font-family:'DM Sans',sans-serif;font-weight:600;font-size:.86rem;cursor:pointer;border-radius:8px;transition:transform .15s,box-shadow .15s}
+.add-btn{display:flex;align-items:center;justify-content:center;gap:7px;background:var(--accent);color:#0b0d12;border:none;padding:9px 17px;font-family:'DM Sans',sans-serif;font-weight:600;font-size:.86rem;cursor:pointer;border-radius:8px;white-space:nowrap;flex-shrink:0;transition:transform .15s,box-shadow .15s}
 .add-btn:hover{transform:translateY(-2px);box-shadow:0 5px 20px rgba(232,255,71,.22)}
 
 /* Toast */
-#toast{position:fixed;bottom:26px;left:50%;transform:translateX(-50%) translateY(70px);background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:9px 20px;border-radius:40px;font-size:.83rem;font-weight:500;opacity:0;transition:transform .28s,opacity .28s;pointer-events:none;z-index:999;white-space:nowrap}
+#toast{position:fixed;bottom:calc(26px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%) translateY(70px);background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:9px 20px;border-radius:20px;font-size:.83rem;font-weight:500;opacity:0;transition:transform .28s,opacity .28s;pointer-events:none;z-index:999;width:max-content;max-width:calc(100vw - 32px);text-align:center;overflow-wrap:anywhere}
 #toast.show{transform:translateX(-50%) translateY(0);opacity:1}
 #toast.success{border-color:var(--success);color:var(--success)}
 #toast.error{border-color:var(--danger);color:var(--danger)}
 
 /* Grid */
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(400px,1fr));gap:24px;padding:28px 36px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(400px,100%),1fr));gap:24px;padding:28px 36px}
 
 /* Card */
-.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;display:flex;flex-direction:column;animation:up .28s ease;transition:box-shadow .2s}
+.card{--c:var(--accent);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;display:flex;flex-direction:column;min-width:0;animation:up .28s ease;transition:box-shadow .2s}
 .card:hover{box-shadow:0 8px 30px rgba(0,0,0,.28)}
 @keyframes up{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
-.card-line{height:3px;width:100%}
+.card-line{height:3px;width:100%;background:var(--c)}
 .card-header{display:flex;align-items:center;justify-content:space-between;padding:14px 16px 11px;border-bottom:1px solid var(--border);gap:9px}
 .name-wrap{display:flex;align-items:center;gap:9px;flex:1;min-width:0}
-.ex-icon{width:32px;height:32px;background:var(--surface2);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:1rem;flex-shrink:0;cursor:pointer;transition:background .15s;user-select:none}
+.ex-icon{width:32px;height:32px;background:var(--surface2);border:none;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:1rem;flex-shrink:0;cursor:pointer;transition:background .15s;user-select:none}
 .ex-icon:hover{background:var(--border)}
 .ex-name{font-family:'Bebas Neue',sans-serif;font-size:1.25rem;letter-spacing:.08em;color:var(--text);background:transparent;border:none;outline:none;width:100%;min-width:0}
 .ex-name::placeholder{color:var(--muted)}
@@ -305,22 +485,28 @@ header{display:flex;align-items:center;justify-content:space-between;padding:18p
 .unit-input{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:4px 10px;border-radius:6px;font-family:'DM Sans',sans-serif;font-size:.82rem;width:110px;outline:none;transition:border-color .15s}
 .unit-input:focus{border-color:var(--accent2)}
 .stat-bar{display:flex;padding:9px 16px 11px;border-bottom:1px solid var(--border)}
-.stat{display:flex;flex-direction:column;gap:2px;flex:1}
-.stat-val{font-family:'Bebas Neue',sans-serif;font-size:1.2rem;letter-spacing:.05em;line-height:1}
-.stat-lbl{font-size:.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:.07em}
+.stat{display:flex;flex-direction:column;gap:2px;flex:1;min-width:0}
+.stat-val{font-family:'Bebas Neue',sans-serif;font-size:1.2rem;letter-spacing:.05em;line-height:1;color:var(--c)}
+.stat-lbl{font-size:.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sdiv{width:1px;background:var(--border);margin:0 10px}
-.entry-form{display:flex;align-items:flex-end;gap:8px;padding:11px 16px;background:var(--surface2);border-bottom:1px solid var(--border)}
-.field{display:flex;flex-direction:column;gap:4px;flex:1}
-.field label{font-size:.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;font-weight:500}
-.field input{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:7px;font-family:'DM Sans',sans-serif;font-size:.86rem;outline:none;width:100%;transition:border-color .15s}
+.entry-form{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr) minmax(0,.8fr) auto;align-items:end;gap:8px;padding:11px 16px;background:var(--surface2);border-bottom:1px solid var(--border)}
+.field{display:flex;flex-direction:column;gap:4px;min-width:0}
+.field label{font-size:.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.field input{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:7px;font-family:'DM Sans',sans-serif;font-size:.86rem;outline:none;width:100%;min-width:0;height:35px;transition:border-color .15s}
 .field input:focus{border-color:var(--accent)}
 .field input.error{border-color:var(--danger)!important}
 .field input[type="date"]::-webkit-calendar-picker-indicator{filter:invert(.4);cursor:pointer}
-.log-btn{background:var(--accent);color:#0b0d12;border:none;padding:7px 15px;font-family:'DM Sans',sans-serif;font-weight:600;font-size:.84rem;border-radius:7px;cursor:pointer;height:35px;white-space:nowrap;transition:background .15s,transform .1s;flex-shrink:0}
+/* iOS Safari: native date inputs have an intrinsic min width and ignore
+   width:100% unless the native appearance is removed. */
+@supports (-webkit-touch-callout:none){
+  .field input[type="date"]{-webkit-appearance:none;appearance:none;display:block;line-height:19px}
+  .field input[type="date"]::-webkit-date-and-time-value{text-align:left}
+}
+.log-btn{background:var(--accent);color:#0b0d12;border:none;padding:7px 15px;font-family:'DM Sans',sans-serif;font-weight:600;font-size:.84rem;border-radius:7px;cursor:pointer;height:35px;white-space:nowrap;transition:background .15s,transform .1s}
 .log-btn:hover{background:#d4eb30}
 .log-btn:active{transform:scale(.96)}
-.chart-wrap{padding:13px 13px 9px;height:190px;max-height:190px;overflow:hidden;position:relative;flex-shrink:0}
-.chart-wrap canvas{position:absolute;top:13px;left:13px;right:13px;bottom:9px;width:calc(100% - 26px)!important;height:calc(100% - 22px)!important}
+.chart-wrap{padding:13px 13px 9px;height:190px;position:relative;flex-shrink:0}
+.chart-box{position:relative;width:100%;height:100%;min-width:0}
 .no-data{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;color:var(--muted);font-size:.8rem}
 .no-data svg{opacity:.22}
 .log-section{border-top:1px solid var(--border)}
@@ -343,11 +529,27 @@ header{display:flex;align-items:center;justify-content:space-between;padding:18p
 ::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
 
 @media(max-width:600px){
-  header{padding:14px 16px}
-  .grid{padding:18px 14px;gap:16px;grid-template-columns:1fr}
+  header{padding:calc(14px + env(safe-area-inset-top)) max(16px,env(safe-area-inset-right)) 14px max(16px,env(safe-area-inset-left))}
+  .grid{padding:18px 14px;gap:16px;grid-template-columns:minmax(0,1fr)}
   .logo{font-size:1.6rem}
-  .user-email{display:none}
+  .user-email,.sync-text{display:none}
+  .user-pill{padding:5px}
   .auth-box{padding:28px 20px 24px}
+  /* ≥16px stops iOS Safari from zooming in when an input is focused */
+  .auth-input,.field input,.unit-input{font-size:16px}
+  .ex-name{font-size:max(16px,1.25rem)}
+  .entry-form{grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto}
+  .field-date{grid-column:1/-1}
+}
+@media(max-width:440px){
+  .hright{gap:8px}
+  .add-label{display:none}
+  .add-btn{width:36px;height:36px;padding:0}
+  .signout-btn{padding:6px 10px}
+}
+@media(max-width:360px){
+  .logo{font-size:1.35rem;letter-spacing:.1em}
+  .signout-btn{padding:6px 8px;font-size:.72rem}
 }
 </style>
 </head>
@@ -400,196 +602,313 @@ header{display:flex;align-items:center;justify-content:space-between;padding:18p
   <header>
     <div class="logo">LIFT<span>LOG</span></div>
     <div class="hright">
-      <div class="user-pill">
+      <div class="sync" id="sync" data-state="saving" role="status" aria-live="polite"><span class="sync-dot"></span><span class="sync-text">Connecting…</span></div>
+      <div class="user-pill" id="user-pill">
         <div class="user-avatar" id="user-avatar">?</div>
         <span class="user-email" id="user-email"></span>
       </div>
       <button class="signout-btn" onclick="doSignOut()">Sign Out</button>
-      <button class="add-btn" onclick="addCard()">
+      <button class="add-btn" onclick="addCard()" aria-label="Add Exercise" title="Add Exercise">
         <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M6 1v10M1 6h10" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
-        Add Exercise
+        <span class="add-label">Add Exercise</span>
       </button>
     </div>
   </header>
   <div class="grid" id="grid"></div>
 </div>
 
-<div id="toast"></div>
+<div id="toast" role="status" aria-live="polite"></div>
 
 <script>
 const PALETTE=['#e8ff47','#47b4ff','#ff8c47','#b047ff','#47ffb4','#ff4787','#ff47d4','#47ffd4'];
 const ICONS  =['💪','🏃','🚴','🧘','⚽','🏊','🤸','🥊','🎽','🏋️','🧗','🤾'];
-let colorIdx =0;
 
 function gid()       { return Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
-function today()     { return new Date().toISOString().split('T')[0]; }
+function today()     { const d=new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; }
 function fmtD(d)     { if(!d)return''; const[y,m,day]=d.split('-'); return`${m}/${day}/${y.slice(2)}`; }
-function nc()        { return PALETTE[colorIdx++%PALETTE.length]; }
-function esc(s)      { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function esc(s)      { return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function hexRgba(h,a){ const r=parseInt(h.slice(1,3),16),g=parseInt(h.slice(3,5),16),b=parseInt(h.slice(5,7),16); return`rgba(${r},${g},${b},${a})`; }
 function card(id)    { return (window._cards||[]).find(c=>c.id===id); }
+function hasReps(e)  { return typeof e.reps==='number' && Number.isFinite(e.reps); }
+function fmtEntry(e,unit,repsWord='') { return `${e.amount} ${unit}`+(hasReps(e)?` × ${e.reps}${repsWord}`:''); }
+function sortEntries(entries) { return [...(entries||[])].sort((a,b)=>String(a.date).localeCompare(String(b.date))); }
+function nextColor() { return PALETTE[(window._cards||[]).length%PALETTE.length]; }
 
 let _tt;
-window.showToast = function(msg,type='') {
+window.showToast = function(msg,type='',ms=2800) {
   const t=document.getElementById('toast');
   t.textContent=msg; t.className=`show ${type}`;
-  clearTimeout(_tt); _tt=setTimeout(()=>t.className='',2800);
+  clearTimeout(_tt); _tt=setTimeout(()=>t.className='',ms);
 };
 
 // ── Mutations ────────────────────────────────────────────────────────────────
-function persist(c) {
-  window._saveCard(c);
-}
+// Cards in window._cards are the latest Firestore snapshot and are never
+// mutated here: every change is a field-level write, and the snapshot listener
+// (which fires immediately from the local cache) re-renders.
+let pendingFocusId=null;
 
 function addCard() {
-  const c={id:gid(),name:'New Exercise',unit:'reps',icon:ICONS[Math.floor(Math.random()*ICONS.length)],color:nc(),entries:[],createdAt:Date.now()};
-  window._saveCard(c);
+  const c={id:gid(),name:'New Exercise',unit:'reps',icon:ICONS[Math.floor(Math.random()*ICONS.length)],color:nextColor(),entries:[],createdAt:Date.now()};
+  pendingFocusId=c.id;
+  window.LL.createExercise(c);
   showToast('Exercise added ✓','success');
-  setTimeout(()=>{ const el=document.querySelector(`#card-${c.id} .ex-name`); if(el){el.focus();el.select();} },120);
 }
 
 function deleteCard(id) {
   if(!confirm('Delete this exercise and all its data?')) return;
-  window._removeCard(id);
-  if(chartInst[id]){ chartInst[id].destroy(); delete chartInst[id]; }
+  window.LL.deleteExercise(id);
   showToast('Exercise deleted','error');
 }
 
 function logEntry(id) {
-  const c=card(id); if(!c) return;
-  const dEl=document.getElementById(`date-${id}`);
-  const aEl=document.getElementById(`amt-${id}`);
+  const c=card(id), v=views.get(id); if(!c||!v) return;
+  const dEl=v.el.querySelector('.in-date'), aEl=v.el.querySelector('.in-amt'), rEl=v.el.querySelector('.in-reps');
+  const flag=el=>{el.classList.add('error');setTimeout(()=>el.classList.remove('error'),800);};
   const amt=parseFloat(aEl.value);
-  if(!dEl.value||isNaN(amt)||amt<0){aEl.classList.add('error');setTimeout(()=>aEl.classList.remove('error'),800);return;}
-  c.entries=[...(c.entries||[]),{id:gid(),date:dEl.value,amount:amt}];
-  persist(c); aEl.value='';
-  showToast(`Logged ${amt} ${c.unit} ✓`,'success');
+  if(!dEl.value){flag(dEl);return;}
+  if(aEl.value===''||isNaN(amt)||amt<0){flag(aEl);return;}
+  const entry={id:gid(),date:dEl.value,amount:amt};
+  if(rEl.value.trim()!==''){
+    const reps=Number(rEl.value);
+    if(!Number.isInteger(reps)||reps<0){flag(rEl);return;}
+    entry.reps=reps;
+  }
+  window.LL.addEntry(id,entry);
+  aEl.value=''; rEl.value='';
+  showToast(`Logged ${fmtEntry(entry,c.unit)} ✓`,'success');
 }
 
 function deleteEntry(cid,eid) {
   const c=card(cid); if(!c) return;
-  c.entries=(c.entries||[]).filter(e=>e.id!==eid);
-  persist(c);
+  // arrayRemove needs the exact stored object, so pass the one from the snapshot.
+  const e=(c.entries||[]).find(e=>e.id===eid); if(!e) return;
+  window.LL.removeEntry(cid,e);
 }
 
-function updateName(id,val) { const c=card(id); if(c){c.name=val;persist(c);} }
-function updateUnit(id,val) { const c=card(id); if(c){c.unit=val;persist(c);} }
+function updateField(id,field,val) {
+  const c=card(id); if(!c||c[field]===val) return;
+  window.LL.updateExercise(id,{[field]:val});
+}
 
 function cycleIcon(id) {
   const c=card(id); if(!c) return;
   const i=ICONS.indexOf(c.icon);
-  c.icon=ICONS[(i+1)%ICONS.length];
-  persist(c);
+  window.LL.updateExercise(id,{icon:ICONS[(i+1)%ICONS.length]});
 }
 
 function toggleLog(id) {
-  const w=document.getElementById(`logtable-${id}`);
-  const b=document.getElementById(`toggle-${id}`);
-  b.classList.toggle('open',w.classList.toggle('visible'));
+  const v=views.get(id); if(!v) return;
+  const open=v.el.querySelector('.log-table-wrap').classList.toggle('visible');
+  v.el.querySelector('.log-toggle').classList.toggle('open',open);
 }
 
 // ── Render ───────────────────────────────────────────────────────────────────
-const chartInst={};
+// Cards are keyed by id and patched in place, so a snapshot never rebuilds the
+// grid: scroll position, open history tables and in-progress input survive.
+const views=new Map();   // id → { el, sig, chart }
+let cardsReady=false;
+
+window.setCards = function(cards,ready) {
+  window._cards=cards; cardsReady=ready;
+  window.renderAll();
+};
+
+window.resetCards = function() {
+  views.forEach(v=>v.chart&&v.chart.destroy());
+  views.clear();
+  window._cards=[]; cardsReady=false; pendingFocusId=null;
+  const grid=document.getElementById('grid'); if(grid) grid.innerHTML='';
+};
 
 window.renderAll = function() {
   const grid=document.getElementById('grid'); if(!grid) return;
-  const open=new Set(); document.querySelectorAll('.log-table-wrap.visible').forEach(el=>open.add(el.id.replace('logtable-','')));
-  grid.innerHTML='';
   const cards=window._cards||[];
+  const ids=new Set(cards.map(c=>c.id));
+
+  views.forEach((v,id)=>{ if(!ids.has(id)){ v.chart&&v.chart.destroy(); v.el.remove(); views.delete(id); } });
+
+  let placeholder=grid.querySelector('.empty');
   if(!cards.length){
-    grid.innerHTML=`<div class="empty"><svg width="42" height="42" viewBox="0 0 24 24" fill="none" style="margin:0 auto 12px;display:block;opacity:.2"><rect x="3" y="3" width="18" height="18" rx="3" stroke="#5c6380" stroke-width="1.5"/><path d="M12 8v8M8 12h8" stroke="#5c6380" stroke-width="1.5" stroke-linecap="round"/></svg><p>No exercises yet. Click <strong style="color:#dde1f0">Add Exercise</strong> to begin.</p></div>`;
+    if(!placeholder){ placeholder=document.createElement('div'); placeholder.className='empty'; grid.appendChild(placeholder); }
+    placeholder.innerHTML=cardsReady
+      ? `<svg width="42" height="42" viewBox="0 0 24 24" fill="none" style="margin:0 auto 12px;display:block;opacity:.2"><rect x="3" y="3" width="18" height="18" rx="3" stroke="#5c6380" stroke-width="1.5"/><path d="M12 8v8M8 12h8" stroke="#5c6380" stroke-width="1.5" stroke-linecap="round"/></svg><p>No exercises yet. Tap <strong style="color:#dde1f0">+ Add Exercise</strong> to begin.</p>`
+      : `<p>Loading…</p>`;
     return;
   }
+  placeholder?.remove();
+
+  let prev=null;
   cards.forEach(c=>{
-    grid.appendChild(buildCard(c));
-    updateChart(c.id);
-    if(open.has(c.id)){document.getElementById(`logtable-${c.id}`)?.classList.add('visible');document.getElementById(`toggle-${c.id}`)?.classList.add('open');}
+    let v=views.get(c.id);
+    if(!v){ v={el:buildCard(c),sig:null,chart:null}; views.set(c.id,v); }
+    const sig=JSON.stringify([c.name,c.unit,c.icon,c.color,c.entries]);
+    if(sig!==v.sig){ patchCard(v,c); v.sig=sig; }
+    const want=prev?prev.nextSibling:grid.firstChild;
+    if(v.el!==want) grid.insertBefore(v.el,want);
+    prev=v.el;
   });
+
+  if(pendingFocusId&&views.has(pendingFocusId)){
+    const el=views.get(pendingFocusId).el; pendingFocusId=null;
+    el.scrollIntoView({behavior:'smooth',block:'center'});
+    const name=el.querySelector('.ex-name');
+    name.focus({preventScroll:true}); name.select();
+  }
 };
 
+// Static skeleton, built once per card. Dynamic parts are filled by patchCard.
 function buildCard(c) {
-  const entries=c.entries||[];
-  const sorted=[...entries].sort((a,b)=>new Date(a.date)-new Date(b.date));
-  const total=entries.reduce((s,e)=>s+e.amount,0);
-  const avg=entries.length?(total/entries.length).toFixed(1):'—';
-  const best=entries.length?Math.max(...entries.map(e=>e.amount)):'—';
   const div=document.createElement('div');
-  div.className='card'; div.id=`card-${c.id}`;
+  div.className='card'; div.dataset.id=c.id;
   div.innerHTML=`
-    <div class="card-line" style="background:${c.color}"></div>
+    <div class="card-line"></div>
     <div class="card-header">
       <div class="name-wrap">
-        <div class="ex-icon" onclick="cycleIcon('${c.id}')" title="Click to change icon">${c.icon}</div>
-        <input class="ex-name" value="${esc(c.name)}" placeholder="Exercise Name" onblur="updateName('${c.id}',this.value)">
+        <button type="button" class="ex-icon" data-action="icon" title="Change icon" aria-label="Change icon"></button>
+        <input class="ex-name" placeholder="Exercise Name" aria-label="Exercise name" enterkeyhint="done">
       </div>
       <div class="card-btns">
-        <button class="icon-btn" onclick="deleteCard('${c.id}')" title="Delete">
+        <button class="icon-btn" data-action="delete" title="Delete exercise" aria-label="Delete exercise">
           <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><path d="M1 1l9 9M10 1l-9 9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
         </button>
       </div>
     </div>
     <div class="unit-row">
       <label>Unit</label>
-      <input class="unit-input" value="${esc(c.unit)}" placeholder="reps/miles/min" onblur="updateUnit('${c.id}',this.value)">
+      <input class="unit-input" placeholder="reps/miles/min" aria-label="Unit" enterkeyhint="done">
     </div>
     <div class="stat-bar">
-      <div class="stat"><span class="stat-val" style="color:${c.color}">${entries.length}</span><span class="stat-lbl">Entries</span></div>
+      <div class="stat"><span class="stat-val s-count"></span><span class="stat-lbl">Entries</span></div>
       <div class="sdiv"></div>
-      <div class="stat"><span class="stat-val" style="color:${c.color}">${avg}</span><span class="stat-lbl">Avg ${esc(c.unit)}</span></div>
+      <div class="stat"><span class="stat-val s-avg"></span><span class="stat-lbl s-avg-lbl"></span></div>
       <div class="sdiv"></div>
-      <div class="stat"><span class="stat-val" style="color:${c.color}">${best}</span><span class="stat-lbl">Best</span></div>
+      <div class="stat"><span class="stat-val s-best"></span><span class="stat-lbl">Best</span></div>
     </div>
     <div class="entry-form">
-      <div class="field"><label>Date</label><input type="date" id="date-${c.id}" value="${today()}"></div>
-      <div class="field"><label>Amount (${esc(c.unit)})</label><input type="number" id="amt-${c.id}" placeholder="0" min="0" step="any" onkeydown="if(event.key==='Enter')logEntry('${c.id}')"></div>
-      <button class="log-btn" onclick="logEntry('${c.id}')">Log</button>
+      <div class="field field-date"><label>Date</label><input type="date" class="in-date" value="${today()}"></div>
+      <div class="field"><label class="amt-lbl"></label><input type="number" class="in-amt" placeholder="0" min="0" step="any" inputmode="decimal" enterkeyhint="done"></div>
+      <div class="field"><label>Reps</label><input type="number" class="in-reps" placeholder="—" min="0" step="1" inputmode="numeric" pattern="[0-9]*" enterkeyhint="done"></div>
+      <button class="log-btn" data-action="log">Log</button>
     </div>
     <div class="chart-wrap">
-      <canvas id="chart-${c.id}"></canvas>
-      ${sorted.length<2?`<div class="no-data" id="nodata-${c.id}"><svg width="33" height="33" viewBox="0 0 24 24" fill="none"><polyline points="3,17 8,12 13,15 21,7" stroke="#5c6380" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Log 2+ entries to see your chart</span></div>`:''}
+      <div class="chart-box"><canvas></canvas></div>
+      <div class="no-data"><svg width="33" height="33" viewBox="0 0 24 24" fill="none"><polyline points="3,17 8,12 13,15 21,7" stroke="#5c6380" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Log 2+ entries to see your chart</span></div>
     </div>
     <div class="log-section">
-      <button class="log-toggle" id="toggle-${c.id}" onclick="toggleLog('${c.id}')">
+      <button class="log-toggle" data-action="toggle">
         <svg class="chev" width="11" height="11" viewBox="0 0 11 11" fill="none"><path d="M1.5 3.5l4 4 4-4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        History (${entries.length})
+        <span class="hist-lbl"></span>
       </button>
-      <div class="log-table-wrap" id="logtable-${c.id}">
+      <div class="log-table-wrap">
         <table class="log-table">
           <thead><tr><th>Date</th><th>Amount</th><th></th></tr></thead>
-          <tbody>${sorted.slice().reverse().map(e=>`<tr><td>${fmtD(e.date)}</td><td>${e.amount} ${esc(c.unit)}</td><td class="del" onclick="deleteEntry('${c.id}','${e.id}')">✕</td></tr>`).join('')}</tbody>
+          <tbody></tbody>
         </table>
       </div>
     </div>`;
   return div;
 }
 
-function updateChart(id) {
-  const c=card(id); if(!c) return;
-  const sorted=[...(c.entries||[])].sort((a,b)=>new Date(a.date)-new Date(b.date));
-  const canvas=document.getElementById(`chart-${id}`); if(!canvas) return;
-  if(sorted.length<2){ if(chartInst[id]){chartInst[id].destroy();delete chartInst[id];} return; }
-  document.getElementById(`nodata-${id}`)?.remove();
-  if(chartInst[id]) chartInst[id].destroy();
-  const wrap=canvas.parentElement;
-  const W=wrap.clientWidth-26, H=wrap.clientHeight-22;
-  canvas.width=W; canvas.height=H;
-  canvas.style.width=W+'px'; canvas.style.height=H+'px';
-  chartInst[id]=new Chart(canvas,{
-    type:'line',
-    data:{
-      labels:sorted.map(e=>fmtD(e.date)),
-      datasets:[{data:sorted.map(e=>e.amount),borderColor:c.color,backgroundColor:hexRgba(c.color,.07),borderWidth:2.5,pointBackgroundColor:c.color,pointRadius:4,pointHoverRadius:6,tension:.35,fill:true}]
-    },
-    options:{
-      responsive:false,maintainAspectRatio:false,animation:{duration:340},
-      plugins:{legend:{display:false},tooltip:{backgroundColor:'#181c28',borderColor:'#252b3d',borderWidth:1,titleColor:'#5c6380',bodyColor:'#dde1f0',callbacks:{label:ctx=>` ${ctx.parsed.y} ${c.unit}`}}},
-      scales:{
-        x:{grid:{color:'rgba(37,43,61,.55)',drawBorder:false},ticks:{color:'#5c6380',font:{family:'DM Sans',size:10},maxRotation:30},border:{display:false}},
-        y:{grid:{color:'rgba(37,43,61,.55)',drawBorder:false},ticks:{color:'#5c6380',font:{family:'DM Sans',size:10}},border:{display:false}}
+function setInput(el,val) {
+  // Never overwrite a field the user is currently editing.
+  if(document.activeElement!==el && el.value!==val) el.value=val;
+}
+
+function patchCard(v,c) {
+  const el=v.el, q=s=>el.querySelector(s);
+  const entries=c.entries||[];
+  const sorted=sortEntries(entries);
+  const unit=c.unit||'';
+  const total=entries.reduce((s,e)=>s+e.amount,0);
+
+  el.style.setProperty('--c',c.color||'#e8ff47');
+  q('.ex-icon').textContent=c.icon||'💪';
+  setInput(q('.ex-name'),c.name||'');
+  setInput(q('.unit-input'),unit);
+  q('.s-count').textContent=entries.length;
+  q('.s-avg').textContent=entries.length?(total/entries.length).toFixed(1):'—';
+  q('.s-avg-lbl').textContent=`Avg ${unit}`;
+  q('.s-best').textContent=entries.length?Math.max(...entries.map(e=>e.amount)):'—';
+  q('.amt-lbl').textContent=`Amount (${unit})`;
+  q('.hist-lbl').textContent=`History (${entries.length})`;
+  q('tbody').innerHTML=sorted.slice().reverse().map(e=>
+    `<tr><td>${esc(fmtD(e.date))}</td><td>${esc(fmtEntry(e,unit))}</td><td class="del" data-action="del-entry" data-eid="${esc(e.id)}" title="Delete entry">✕</td></tr>`).join('');
+  syncChart(v,c,sorted);
+}
+
+function syncChart(v,c,sorted) {
+  const noData=v.el.querySelector('.no-data');
+  if(sorted.length<2){
+    if(v.chart){v.chart.destroy();v.chart=null;}
+    noData.hidden=false; return;
+  }
+  noData.hidden=true;
+  const color=c.color||'#e8ff47';
+  const labels=sorted.map(e=>fmtD(e.date)), data=sorted.map(e=>e.amount);
+  if(!v.chart){
+    v.chart=new Chart(v.el.querySelector('canvas'),{
+      type:'line',
+      data:{labels,datasets:[{data,borderWidth:2.5,pointRadius:4,pointHoverRadius:6,tension:.35,fill:true}]},
+      options:{
+        // Chart.js resizes with its container (resize / orientation change).
+        responsive:true,maintainAspectRatio:false,animation:{duration:340},
+        plugins:{legend:{display:false},tooltip:{backgroundColor:'#181c28',borderColor:'#252b3d',borderWidth:1,titleColor:'#5c6380',bodyColor:'#dde1f0',
+          callbacks:{label:ctx=>{ const ch=ctx.chart, e=ch.$entries[ctx.dataIndex]; return ' '+(e?fmtEntry(e,ch.$unit,' reps'):`${ctx.parsed.y} ${ch.$unit}`); }}}},
+        scales:{
+          x:{grid:{color:'rgba(37,43,61,.55)'},ticks:{color:'#5c6380',font:{family:'DM Sans',size:10},maxRotation:30},border:{display:false}},
+          y:{grid:{color:'rgba(37,43,61,.55)'},ticks:{color:'#5c6380',font:{family:'DM Sans',size:10}},border:{display:false}}
+        }
       }
+    });
+  } else {
+    v.chart.data.labels=labels;
+    v.chart.data.datasets[0].data=data;
+  }
+  const ds=v.chart.data.datasets[0];
+  ds.borderColor=color; ds.pointBackgroundColor=color; ds.backgroundColor=hexRgba(color,.07);
+  v.chart.$entries=sorted; v.chart.$unit=c.unit||'';
+  v.chart.update();
+}
+
+// ── Events (delegated, so they survive in-place updates) ────────────────────
+(function(){
+  const grid=document.getElementById('grid');
+  const idOf=el=>el.closest('.card')?.dataset.id;
+
+  grid.addEventListener('click',e=>{
+    const t=e.target.closest('[data-action]'); if(!t) return;
+    const id=idOf(t); if(!id) return;
+    switch(t.dataset.action){
+      case 'icon':      cycleIcon(id); break;
+      case 'delete':    deleteCard(id); break;
+      case 'log':       logEntry(id); break;
+      case 'toggle':    toggleLog(id); break;
+      case 'del-entry': deleteEntry(id,t.dataset.eid); break;
     }
   });
-}
+
+  grid.addEventListener('focusout',e=>{
+    const t=e.target, id=idOf(t); if(!id) return;
+    if(t.classList.contains('ex-name'))    updateField(id,'name',t.value);
+    if(t.classList.contains('unit-input')) updateField(id,'unit',t.value);
+  });
+
+  grid.addEventListener('keydown',e=>{
+    if(e.key!=='Enter') return;
+    const t=e.target, id=idOf(t); if(!id) return;
+    if(t.classList.contains('in-amt')||t.classList.contains('in-reps')){ e.preventDefault(); logEntry(id); }
+    else if(t.classList.contains('ex-name')||t.classList.contains('unit-input')) t.blur();
+  });
+
+  // Roll untouched date fields forward if the app stays open past midnight.
+  let lastToday=today();
+  document.addEventListener('visibilitychange',()=>{
+    if(document.visibilityState!=='visible') return;
+    const t=today(); if(t===lastToday) return;
+    document.querySelectorAll('.in-date').forEach(el=>{ if(el.value===lastToday&&document.activeElement!==el) el.value=t; });
+    lastToday=t;
+  });
+})();
 </script>
 </body>
 </html>
